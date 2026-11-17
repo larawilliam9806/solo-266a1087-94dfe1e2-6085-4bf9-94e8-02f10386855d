@@ -14,6 +14,7 @@ GET /catalog?token=<t>&page=<n>    凭快照令牌翻页（page 从 1 开始）
 POST /admin/switch-version        切换版本，旧版本全部令牌失效
 POST /admin/fail-page-once        令某版本的某一页下一次请求失败（500，仅一次）
 POST /admin/invalidate-token      立即令所有存活令牌失效
+POST /admin/reset                 重置为初始状态（首个版本、清空令牌与故障注入）
 GET  /admin/state                 查询源当前状态
 """
 
@@ -89,6 +90,16 @@ class SourceState:
             self._kill_all_live_locked()
             self.current_token = None
             return {"ok": True}
+
+    def reset(self) -> dict:
+        """重置为初始状态：回到首个版本、清空令牌与故障注入（演示/自测用）。"""
+        with self._lock:
+            self._kill_all_live_locked()
+            self.dead_tokens.clear()
+            self.version = ALL_VERSIONS[0]
+            self.fail_once.clear()
+            token = self._mint_locked()
+            return {"ok": True, "version": self.version, "token": token}
 
     def arm_fail_once(self, version: str, page: int) -> dict:
         with self._lock:
@@ -220,6 +231,11 @@ def admin_fail_page_once(version: str = Query(...), page: int = Query(...)) -> J
 @app.post("/admin/invalidate-token")
 def admin_invalidate() -> dict:
     return state.invalidate()
+
+
+@app.post("/admin/reset")
+def admin_reset() -> dict:
+    return state.reset()
 
 
 @app.get("/admin/state")

@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>藏品校订 · 博物馆开放目录</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #0b1220; color: #e2e8f0; }
+  main { max-width: 1180px; margin: 0 auto; padding: 28px 20px 70px; }
+  h1 { font-size: 23px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 24px; }
+  .sub a { color: #7dd3fc; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+  .card h2 { font-size: 15px; margin: 0 0 14px; color: #7dd3fc; }
+  button { font: inherit; border-radius: 8px; border: 1px solid #475569; padding: 6px 12px;
+    background: #2563eb; color: #fff; cursor: pointer; font-size: 12.5px; }
+  button:hover { background: #1d4ed8; }
+  button.ghost { background: #334155; }
+  button.ghost:hover { background: #475569; }
+  button.warn { background: #92400e; border-color: #b45309; }
+  button.warn:hover { background: #b45309; }
+  button.ok-btn { background: #15803d; border-color: #16a34a; }
+  button.ok-btn:hover { background: #166534; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #334155; vertical-align: top; }
+  th { color: #94a3b8; font-weight: 500; }
+  code { background: #0f172a; padding: 2px 6px; border-radius: 6px; font-size: 11.5px; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+  .b-active { background: #14532d; color: #bbf7d0; }
+  .b-conflict { background: #7f1d1d; color: #fecaca; }
+  .src { color: #94a3b8; }
+  .eff { color: #f1f5f9; font-weight: 600; }
+  .basis { color: #94a3b8; font-size: 11px; margin-top: 3px; }
+  .conflict-box { background: #450a0a; border: 1px solid #b91c1c; border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px; font-size: 13px; color: #fecaca; }
+  .field-cell .btns { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  input.corr-input { width: 100%; font: inherit; font-size: 12.5px; padding: 6px 9px; border-radius: 7px;
+    border: 1px solid #475569; background: #0f172a; color: #f1f5f9; margin-bottom: 6px; }
+  #msg { min-height: 18px; font-size: 13px; margin-top: 10px; }
+  .ok { color: #4ade80; } .err { color: #f87171; }
+  .muted { color: #94a3b8; font-size: 12px; }
+  .dl { background: #15803d; } .dl:hover { background: #166534; }
+  .meta-line { font-size: 13px; line-height: 1.9; }
+  .tr-conflict { background: rgba(127, 29, 29, .18); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🖋 藏品校订（年代 / 材质）</h1>
+  <div class="sub">
+    人工校订供研究使用，原始发布数据不受影响 ·
+    <a href="/">← 返回采集台</a> ·
+    <a href="/api/published/download">下载原始发布 JSON</a> ·
+    <a href="/docs">API 文档</a>
+  </div>
+
+  <div id="conflictBanner" class="conflict-box" style="display:none"></div>
+
+  <section class="card">
+    <h2>① 当前发布与校订状态</h2>
+    <div id="meta" class="meta-line muted">加载中…</div>
+    <div class="row" style="margin-top:12px">
+      <button class="dl" id="dlCorrected" onclick="downloadCorrected()">⬇ 下载校订版 JSON</button>
+      <button class="ghost" onclick="downloadRaw()">⬇ 下载原始发布 JSON</button>
+      <button class="ghost" onclick="load(true)">刷新</button>
+    </div>
+    <div id="msg"></div>
+    <p class="muted">
+      校订规则：源未变则沿用校订；源已更正为校订值则差异自动消除；
+      源值偏离校订依据且不同于校订值则列为冲突，需逐字段裁决；
+      未校订字段随源更新；源删除的藏品连同其校订一并移除。
+      存在未决冲突时禁止下载校订版。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>② 藏品字段校订（每 2 秒自动刷新；编辑中暂停刷新）</h2>
+    <table>
+      <thead>
+        <tr><th style="width:90px">编号</th><th style="width:180px">名称（随源）</th>
+            <th>年代</th><th>材质</th></tr>
+      </thead>
+      <tbody id="itemRows"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const FIELD_LABEL = {era: "年代", material: "材质"};
+let VIEW = null;        // 最近一次 /api/corrected 响应（含 revision，作为提交依据）
+let editing = null;     // 正在编辑的 "itemId:field"，编辑期间暂停自动刷新
+
+function esc(s) {
+  return String(s ?? "—").replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function flash(text, ok) {
+  const el = $("msg");
+  el.textContent = text; el.className = ok ? "ok" : "err";
+  if (ok) setTimeout(() => { el.textContent = ""; }, 5000);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(typeof data.detail === "string" ? data.detail : ("HTTP " + r.status));
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+// 变更提交统一入口：携带当前 revision；409 说明页面所依据的源值/校订已变
+async function mutate(path, opts) {
+  try {
+    const view = await api(path, opts);
+    VIEW = view;
+    editing = null;
+    render();
+    return true;
+  } catch (e) {
+    if (e.status === 409) {
+      flash("提交被拒绝：" + e.message + "（页面已刷新）", false);
+      editing = null;
+      await load();
+    } else {
+      flash("操作失败：" + e.message, false);
+    }
+    return false;
+  }
+}
+
+async function load(manual) {
+  try {
+    VIEW = await api("/api/corrected");
+    render();
+    if (manual) flash("已刷新", true);
+  } catch (e) {
+    $("meta").textContent = "加载失败：" + e.message;
+  }
+}
+
+function render() {
+  const v = VIEW;
+  if (!v) return;
+  // 元信息
+  if (!v.published) {
+    $("meta").innerHTML = `<span class="muted">尚无已发布数据集，请先在<a href="/">采集台</a>完成一个批次。</span>`;
+    $("itemRows").innerHTML = `<tr><td colspan="4" class="muted">无数据</td></tr>`;
+    $("conflictBanner").style.display = "none";
+    $("dlCorrected").disabled = true;
+    return;
+  }
+  const s = v.published;
+  $("meta").innerHTML =
+    `发布于 <b>${esc(s.published_at)}</b> · 批次 #${s.batch_id} · 版本 <code>${esc(s.source_version)}</code> · ` +
+    `快照 <code>${esc(s.snapshot_token)}</code> · 藏品 <b>${s.item_count}</b> 条 · ` +
+    `校订 <b>${v.correction_count}</b> 项 · 未决冲突 <b>${v.conflict_count}</b> 项 · ` +
+    `视图版本 <code>r${v.revision}</code>`;
+  // 冲突横幅与下载开关
+  if (v.conflict_count > 0) {
+    $("conflictBanner").style.display = "";
+    $("conflictBanner").textContent =
+      `⚠ 存在 ${v.conflict_count} 个未决冲突：源值已偏离校订依据。请逐字段裁决（采用源值或保留校订值），裁决完成前禁止下载校订版。`;
+  } else {
+    $("conflictBanner").style.display = "none";
+  }
+  $("dlCorrected").disabled = v.conflict_count > 0;
+  // 藏品行
+  $("itemRows").innerHTML = v.items.map(it => {
+    const hasConflict = ["era", "material"].some(f => it[f].correction && it[f].correction.status === "conflict");
+    return `<tr class="${hasConflict ? "tr-conflict" : ""}">
+      <td>${esc(it.id)}</td><td>${esc(it.name)}</td>
+      <td>${fieldCell(it, "era")}</td><td>${fieldCell(it, "material")}</td>
+    </tr>`;
+  }).join("");
+}
+
+function fieldCell(it, field) {
+  const fv = it[field];
+  const key = it.id + ":" + field;
+  if (editing === key) {
+    const cur = fv.correction ? fv.correction.value : "";
+    return `<div class="field-cell">
+      <div class="src">源值：${esc(fv.source)}</div>
+      <input class="corr-input" id="inp" value="${esc(cur)}" placeholder="输入${FIELD_LABEL[field]}校订值" />
+      <div class="btns">
+        <button class="ok-btn" onclick="saveCorrection('${esc(it.id)}','${field}')">保存</button>
+        <button class="ghost" onclick="cancelEdit()">取消</button>
+      </div>
+    </div>`;
+  }
+  let html = `<div class="field-cell"><div class="src">源值：${esc(fv.source)}</div>`;
+  const c = fv.correction;
+  if (c) {
+    const badge = c.status === "conflict"
+      ? `<span class="badge b-conflict">冲突</span>`
+      : `<span class="badge b-active">已校订</span>`;
+    html += `<div class="eff">校订：${esc(c.value)} ${badge}</div>`;
+    html += `<div class="basis">依据源值：${esc(c.basis)}${c.status === "conflict" ? "（源已改为 " + esc(fv.source) + "）" : ""}</div>`;
+    html += `<div class="btns">`;
+    if (c.status === "conflict") {
+      html += `<button class="warn" onclick="resolve('${esc(it.id)}','${field}','source')">采用源值</button>`;
+      html += `<button class="ok-btn" onclick="resolve('${esc(it.id)}','${field}','corrected')">保留校订值</button>`;
+    }
+    html += `<button class="ghost" onclick="startEdit('${esc(it.id)}','${field}')">修改</button>`;
+    html += `<button class="ghost" onclick="revert('${esc(it.id)}','${field}')">撤销校订</button>`;
+    html += `</div>`;
+  } else {
+    html += `<div class="btns"><button class="ghost" onclick="startEdit('${esc(it.id)}','${field}')">校订</button></div>`;
+  }
+  return html + "</div>";
+}
+
+function startEdit(itemId, field) { editing = itemId + ":" + field; render(); }
+function cancelEdit() { editing = null; render(); }
+
+async function saveCorrection(itemId, field) {
+  const value = document.getElementById("inp").value;
+  const ok = await mutate("/api/corrections", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({item_id: itemId, field, value, base_revision: VIEW.revision})
+  });
+  if (ok) flash(`已保存 ${itemId} 的${FIELD_LABEL[field]}校订`, true);
+}
+async function revert(itemId, field) {
+  const ok = await mutate(`/api/corrections/${encodeURIComponent(itemId)}/${field}?base_revision=${VIEW.revision}`,
+    {method: "DELETE"});
+  if (ok) flash(`已撤销 ${itemId} 的${FIELD_LABEL[field]}校订，恢复随源更新`, true);
+}
+async function resolve(itemId, field, choice) {
+  const ok = await mutate(`/api/corrections/${encodeURIComponent(itemId)}/${field}/resolve`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({choice, base_revision: VIEW.revision})
+  });
+  if (ok) flash(choice === "source" ? "已采用源值，校订作废" : "已保留校订值（以当前源值重新为依据）", true);
+}
+
+function downloadCorrected() { window.location.href = "/api/corrected/download"; }
+function downloadRaw() { window.location.href = "/api/published/download"; }
+
+load();
+setInterval(() => { if (!editing) load(); }, 2000);
+</script>
+</body>
+</html>

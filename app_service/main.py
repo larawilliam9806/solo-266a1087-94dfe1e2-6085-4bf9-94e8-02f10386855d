@@ -7,7 +7,12 @@ POST   /api/batches/{id}/resume    续采失败批次（复用已保存页；inv
 GET    /api/batches                批次列表
 GET    /api/batches/{id}           批次详情（含已保存页号）
 GET    /api/published              当前已发布数据集元数据 + 藏品
-GET    /api/published/download     下载完整 JSON（附件）
+GET    /api/published/download     下载完整 JSON（附件，原始发布版）
+GET    /api/corrected              校订视图（源值 + 校订值 + 冲突状态 + revision）
+POST   /api/corrections            新增/修改校订（携带 base_revision 乐观并发控制）
+DELETE /api/corrections/{item}/{field}        撤销校订
+POST   /api/corrections/{item}/{field}/resolve 逐字段裁决冲突（source|corrected）
+GET    /api/corrected/download     下载校订版 JSON（存在未决冲突时 409）
 GET    /api/config                 前端预填配置
 GET    /health                     健康检查
 """
@@ -18,19 +23,52 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .collector import Collector
 from .config import Settings, settings as default_settings
-from .db import Database
+from .db import CORRECTABLE_FIELDS, CorrectionError, Database
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
 class CreateBatchBody(BaseModel):
     source_url: str = Field(..., min_length=1, description="目录接口地址（指向 /catalog）")
+
+
+class CorrectionBody(BaseModel):
+    item_id: str = Field(..., min_length=1)
+    field: str = Field(..., min_length=1, description="校订字段：era | material")
+    value: str = Field(..., description="校订值")
+    base_revision: int = Field(..., description="提交所依据的校订视图 revision")
+
+
+class ResolveBody(BaseModel):
+    choice: str = Field(..., description="裁决选择：source（采用源值）| corrected（保留校订值）")
+    base_revision: int = Field(..., description="提交所依据的校订视图 revision")
+
+
+# 校订错误码 → HTTP 状态码
+_CORRECTION_HTTP_STATUS = {
+    "stale_revision": 409,
+    "has_conflicts": 409,
+    "item_not_found": 404,
+    "correction_not_found": 404,
+    "bad_field": 400,
+    "empty_value": 400,
+    "same_as_source": 400,
+    "not_conflict": 400,
+    "bad_choice": 400,
+}
+
+
+def _raise_correction(exc: CorrectionError) -> None:
+    raise HTTPException(
+        status_code=_CORRECTION_HTTP_STATUS.get(exc.code, 400),
+        detail=exc.message,
+    ) from exc
 
 
 def _validate_url(url: str) -> str:
@@ -200,6 +238,92 @@ def create_app(settings: Settings | None = None,
                 "Content-Type": "application/json; charset=utf-8",
             },
         )
+
+    # ---------------- 校订 ----------------
+
+    @app.get("/api/corrected")
+    def get_corrected() -> dict:
+        """校订视图：源值、校订值、冲突状态与 revision（供校订页渲染与提交依据）。"""
+        return database.get_corrected_view()
+
+    @app.post("/api/corrections", status_code=201)
+    def create_correction(body: CorrectionBody) -> dict:
+        try:
+            database.upsert_correction(
+                body.item_id, body.field, body.value, body.base_revision)
+        except CorrectionError as exc:
+            _raise_correction(exc)
+        return database.get_corrected_view()
+
+    @app.delete("/api/corrections/{item_id}/{field}")
+    def delete_correction(item_id: str, field: str,
+                          base_revision: int = Query(...)) -> dict:
+        try:
+            database.delete_correction(item_id, field, base_revision)
+        except CorrectionError as exc:
+            _raise_correction(exc)
+        return database.get_corrected_view()
+
+    @app.post("/api/corrections/{item_id}/{field}/resolve")
+    def resolve_correction(item_id: str, field: str, body: ResolveBody) -> dict:
+        try:
+            database.resolve_conflict(item_id, field, body.choice, body.base_revision)
+        except CorrectionError as exc:
+            _raise_correction(exc)
+        return database.get_corrected_view()
+
+    @app.get("/api/corrected/download")
+    def download_corrected() -> JSONResponse:
+        # 视图在单把锁内一次读出：下载必然对应同一完整源快照及校订状态
+        view = database.get_corrected_view()
+        if view["published"] is None:
+            raise HTTPException(status_code=404, detail="尚无已发布数据集，无法生成校订版")
+        if view["conflict_count"] > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"存在 {view['conflict_count']} 个未决冲突，裁决前禁止下载校订版",
+            )
+        snap = view["published"]
+        items = []
+        for it in view["items"]:
+            corrected_fields = {
+                field: {
+                    "source_value": it[field]["source"],
+                    "corrected_value": it[field]["correction"]["value"],
+                }
+                for field in CORRECTABLE_FIELDS
+                if it[field]["correction"] is not None
+            }
+            items.append({
+                "id": it["id"],
+                "name": it["name"],
+                "era": it["era"]["effective"],
+                "material": it["material"]["effective"],
+                "corrected_fields": corrected_fields,
+            })
+        body = {
+            "dataset": "museum-open-catalog-corrected",
+            "published_at": snap["published_at"],
+            "source_version": snap.get("source_version"),
+            "snapshot_token": snap["snapshot_token"],
+            "batch_id": snap["batch_id"],
+            "corrections_revision": view["revision"],
+            "correction_count": view["correction_count"],
+            "item_count": len(items),
+            "items": items,
+        }
+        filename = f"museum-catalog-corrected-batch-{snap['batch_id']}.json"
+        return JSONResponse(
+            content=body,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+
+    @app.get("/corrected", response_class=HTMLResponse)
+    def corrected_page() -> HTMLResponse:
+        return HTMLResponse((BASE_DIR / "corrected.html").read_text(encoding="utf-8"))
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:

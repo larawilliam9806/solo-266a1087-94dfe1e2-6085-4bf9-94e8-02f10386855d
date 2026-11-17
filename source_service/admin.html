@@ -61,6 +61,7 @@
     <h2>③ 令当前快照令牌失效（再翻页返回 410 Gone）</h2>
     <div class="row">
       <button class="danger" onclick="invalidate()">令令牌失效</button>
+      <button class="warn" onclick="resetSource()">重置源（回 v1，清空令牌与故障）</button>
     </div>
   </div>
 
@@ -97,6 +98,11 @@ async function armFail() {
 async function invalidate() {
   try { await api("/admin/invalidate-token", {method: "POST"});
     flash("当前令牌已失效，采集端需新建批次", true); await refresh(); }
+  catch (e) { flash("失败：" + e.message, false); }
+}
+async function resetSource() {
+  try { const d = await api("/admin/reset", {method: "POST"});
+    flash("源已重置到 " + d.version + "，新令牌 " + d.token, true); await refresh(); }
   catch (e) { flash("失败：" + e.message, false); }
 }
 async function refresh() {

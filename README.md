@@ -2,6 +2,8 @@
 
 面向研究人员的博物馆藏品开放目录采集与发布服务。浏览器中填写目录接口地址、
 启动或续采采集批次，并下载当前已发布的完整 JSON 数据集。
+藏品数据员可在**校订页**对年代、材质做人工校订（保留所依据的源值），
+后续采集发布时自动核对源目录的更正，并下载校订版 JSON；原始发布下载保持可用。
 
 - **采集端**：FastAPI + SQLite，网页入口 + REST API（端口 `8000`）
 - **示例源**：独立 FastAPI 服务，内置 3 个版本 × 每版 3 页的藏品数据，
@@ -16,6 +18,7 @@ docker compose up --build
 | 入口 | 地址 |
 | --- | --- |
 | 采集台（研究人员主入口） | http://localhost:8000/ |
+| 藏品校订页（数据员入口） | http://localhost:8000/corrected |
 | 示例源故障控制台 | http://localhost:8001/ |
 | 采集端 API 文档 | http://localhost:8000/docs |
 | 示例源 API 文档 | http://localhost:8001/docs |
@@ -53,6 +56,13 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
 5. 令牌失效的批次状态为 `invalid`，续采会被拒绝，必须 **新建批次**
    获取新快照令牌。
 6. 点击 **⬇ 下载完整 JSON** 获取当前已发布数据集（附件下载）。
+7. 打开 http://localhost:8000/corrected 校订页：
+   - 对某件藏品的年代/材质点 **校订**，填写校订值保存（系统记录所依据的源值）；
+   - 在源控制台切换 v2（A002 年代、A003 材质被源更正，A004 被删除）后新建批次；
+   - 校订页可看到核对结果：源未变的校订沿用、源已改成校订值的自动消除、
+     源改成第三值的列为冲突、被删藏品的校订随藏品移除；
+   - 冲突逐字段裁决（**采用源值** 或 **保留校订值**），存在未决冲突时
+     **禁止下载校订版**；裁决完成后可下载校订版 JSON。
 
 ## 核心业务规则与实现
 
@@ -91,6 +101,28 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
   （id 更大）的批次，较早批次即使后采齐也不得覆盖，批次置
   `superseded`，当前发布原样保留。
 
+### 人工校订（年代 / 材质）
+
+- 校订页（`/corrected`）可修改字段、并排查看源值与校订值、下载校订版
+  JSON；原始发布下载（`/api/published/download`）保持可用、不受校订影响。
+- 每项校订在 `corrections` 表记录 **所依据的源值**（`basis_value`）。
+  每次发布（与发布同一事务内）逐项核对：
+  - 源值未变（仍等于依据）→ **沿用校订**；
+  - 源值已等于校订值 → **差异自动消除**，校订记录清除；
+  - 源值偏离依据且不同于校订值 → 列为 **冲突**，依据与校订值保留待裁决；
+  - 源删除该藏品 → 藏品从校订版移除，其校订一并清除；
+  - 未校订字段随源更新。
+- 冲突逐字段裁决：**采用源值**（校订作废）或 **保留校订值**
+  （以当前源值重新作为校订依据）。存在未决冲突时，
+  `GET /api/corrected/download` 返回 409，禁止下载校订版。
+- **并发一致性**：发布与校订共用同一把 SQLite 写锁，校订视图与校订版
+  下载一次加锁读出，必然对应同一完整源快照及校订状态；`meta` 表中的
+  `revision` 在每次发布或校订变动时递增，校订页所有提交都携带
+  `base_revision`，页面所依据的源值或校订已变时提交被拒绝（409）
+  并提示刷新重载。
+- 采集失败不触碰发布数据与校订；校订与未决冲突持久化在 SQLite，
+  应用重启后完整保留。
+
 ### 并发模型
 
 - 每个批次一个守护线程，网络 IO 使用独立 `httpx.Client`，支持多批并行；
@@ -106,6 +138,11 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
 | GET | `/api/batches/{id}` | 批次详情 |
 | GET | `/api/published` | 当前已发布数据集（元数据 + 藏品） |
 | GET | `/api/published/download` | 下载完整 JSON（`Content-Disposition: attachment`） |
+| GET | `/api/corrected` | 校订视图（源值/校订值/冲突状态 + `revision`） |
+| POST | `/api/corrections` | 新增/修改校订（携带 `base_revision`，过期 409） |
+| DELETE | `/api/corrections/{item}/{field}` | 撤销校订（`?base_revision=`） |
+| POST | `/api/corrections/{item}/{field}/resolve` | 裁决冲突（`choice`: `source`/`corrected`） |
+| GET | `/api/corrected/download` | 下载校订版 JSON（有未决冲突返回 409） |
 | GET | `/api/config` | 前端预填配置 |
 | GET | `/health` | 健康检查（含本次启动恢复的批次 id） |
 
@@ -127,6 +164,25 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
 
 藏品字段为编号 `id`、名称 `name`、年代 `era`、材质 `material`。
 
+校订版下载 JSON 结构（`GET /api/corrected/download`）：
+
+```json
+{
+  "dataset": "museum-open-catalog-corrected",
+  "published_at": "2026-11-17T16:29:57+00:00",
+  "source_version": "v1",
+  "snapshot_token": "snap-v1-...",
+  "batch_id": 1,
+  "corrections_revision": 3,
+  "correction_count": 1,
+  "item_count": 6,
+  "items": [
+    {"id": "A001", "name": "青铜饕餮纹鼎", "era": "商代早期", "material": "青铜",
+     "corrected_fields": {"era": {"source_value": "商代晚期", "corrected_value": "商代早期"}}}
+  ]
+}
+```
+
 ## 数据模型（SQLite）
 
 - `batches`：批次（源地址、绑定快照令牌、版本、总页数、状态、错误信息）
@@ -134,6 +190,10 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
 - `items`：最近一次发布对应的藏品全集
 - `published_items`：对外发布视图（下载/预览读取此表）
 - `published_snapshot`：单行表，记录当前发布来自哪个批次与快照
+- `corrections`：人工校订（藏品编号 + 字段、所依据的源值、校订值、
+  状态 `active`/`conflict`）
+- `meta`：单行元数据（`revision` 随每次发布/校订变动递增，用于校订页
+  乐观并发控制）
 
 批次状态机：`running → published | failed | invalid | superseded`；
 仅 `failed` 可续采。
@@ -154,8 +214,10 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
 .venv/bin/python -m pytest tests/ -q
 ```
 
-`tests/test_e2e.py` 用真实 uvicorn 进程（独立线程事件循环）+ HTTP 调用
-覆盖 8 个关键流程：
+`tests/test_e2e.py` 与 `tests/test_corrections.py` 用真实 uvicorn 进程
+（独立线程事件循环）+ HTTP 调用覆盖 14 个关键流程：
+
+采集与发布（test_e2e.py）：
 
 1. 完整采集、自动发布与 JSON 下载字段校验
 2. 单页一次性失败 → `failed` → 续采复用已保存页 → 发布
@@ -166,21 +228,36 @@ MUSEUM_SOURCE_ADMIN_URL=http://127.0.0.1:8001/ \
 7. 两个批次并行采集
 8. 无发布数据时 404、非法 URL 400、不可达源 502
 
+人工校订（test_corrections.py）：
+
+1. 新增/修改/撤销校订，校订视图与校订版下载，原始发布下载不受影响
+2. 发布时核对：源未变沿用、源=校订值自动消除、源偏离成冲突、
+   源删除清除校订；未校订字段随源更新
+3. 未决冲突禁止下载校订版；逐字段裁决（采用源值 / 保留校订值）后放行
+4. 乐观并发控制：旧 `revision` 的校订/撤销/裁决提交一律 409 并提示重载
+5. 重启保留校订与未决冲突；采集失败不改变校订结果与已发布数据
+6. 参数校验（未知藏品、非法字段、空值、与源值相同等）与空库行为
+
 ## 目录结构
 
 ```
 .
 ├── app_service/            # 采集端（FastAPI + SQLite + 采集线程 + 网页）
-│   ├── main.py             # API 与应用工厂
+│   ├── main.py             # API 与应用工厂（含校订 API）
 │   ├── collector.py        # 批次采集器（后台线程、续采、失效处理）
-│   ├── db.py               # SQLite 持久化与事务化发布
+│   ├── db.py               # SQLite 持久化、事务化发布与校订核对
 │   ├── config.py           # 环境变量配置
-│   └── index.html          # 采集台网页
+│   ├── index.html          # 采集台网页
+│   └── corrected.html      # 藏品校订页
 ├── source_service/         # 本地示例目录源
 │   ├── app.py              # 分页协议 + 故障注入管理接口
-│   ├── catalog_data.py     # 三版示例数据
+│   ├── catalog_data.py     # 三版示例数据（v2 含年代/材质源更正）
 │   └── admin.html          # 故障控制台网页
-├── tests/test_e2e.py       # 端到端自测
+├── tests/
+│   ├── harness.py          # 共享测试设施（uvicorn 服务器 + 临时库）
+│   ├── conftest.py         # harness 夹具（每用例重置源状态）
+│   ├── test_e2e.py         # 采集与发布端到端自测
+│   └── test_corrections.py # 校订端到端自测
 ├── Dockerfile / Dockerfile.source
 ├── docker-compose.yml
 └── requirements.txt
